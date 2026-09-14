@@ -580,6 +580,13 @@ jobs:
           rsync --archive --delete dist/ \
             "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:$remote_directory/"
 
+          version="${RELEASE_TAG#v}"
+          printf '{"version":"%s"}\n' "$version" > latest.json
+          rsync --archive latest.json \
+            "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:/www/wwwroot/accloud/vppn/latest.json.tmp"
+          ssh "${ssh_options[@]}" "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" \
+            "mv -f -- '/www/wwwroot/accloud/vppn/latest.json.tmp' '/www/wwwroot/accloud/vppn/latest.json'"
+
       - name: Send Telegram notification
         if: ${{ github.event_name == 'push' && success() }}
         env:
