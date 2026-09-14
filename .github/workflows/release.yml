@@ -1,0 +1,621 @@
+name: Build and publish VPPN
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Source and release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      target:
+        description: Platform and architecture to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - android
+          - linux
+          - linux-x64
+          - linux-arm64
+          - windows
+          - windows-x64
+          - windows-arm64
+          - macos
+          - macos-x64
+          - macos-arm64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  GO_VERSION: "1.27.0"
+  SOURCE_DIR: source
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      linux_matrix: ${{ steps.targets.outputs.linux_matrix }}
+      windows_matrix: ${{ steps.targets.outputs.windows_matrix }}
+      macos_matrix: ${{ steps.targets.outputs.macos_matrix }}
+    steps:
+      - name: Validate version
+        id: version
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must use vMAJOR.MINOR.PATCH format, got: $REQUESTED_TAG" >&2
+            exit 1
+          fi
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${REQUESTED_TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Resolve build targets
+        id: targets
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ inputs.target || 'all' }}
+        run: |
+          case "$BUILD_TARGET" in
+            linux-x64) linux_matrix='{"include":[{"runner":"ubuntu-24.04","artifact":"linux-x64"}]}' ;;
+            linux-arm64) linux_matrix='{"include":[{"runner":"ubuntu-24.04-arm","artifact":"linux-arm64"}]}' ;;
+            *) linux_matrix='{"include":[{"runner":"ubuntu-24.04","artifact":"linux-x64"},{"runner":"ubuntu-24.04-arm","artifact":"linux-arm64"}]}' ;;
+          esac
+          case "$BUILD_TARGET" in
+            windows-x64) windows_matrix='{"include":[{"runner":"windows-latest","artifact":"windows-x64","installer_args":"","redist_arch":"x64","flutter_channel":"stable","flutter_arch":"x64"}]}' ;;
+            windows-arm64) windows_matrix='{"include":[{"runner":"windows-11-arm","artifact":"windows-arm64","installer_args":"/DArm64","redist_arch":"arm64","flutter_channel":"master","flutter_arch":"arm64"}]}' ;;
+            *) windows_matrix='{"include":[{"runner":"windows-latest","artifact":"windows-x64","installer_args":"","redist_arch":"x64","flutter_channel":"stable","flutter_arch":"x64"},{"runner":"windows-11-arm","artifact":"windows-arm64","installer_args":"/DArm64","redist_arch":"arm64","flutter_channel":"master","flutter_arch":"arm64"}]}' ;;
+          esac
+          case "$BUILD_TARGET" in
+            macos-x64) macos_matrix='{"include":[{"runner":"macos-15-intel","artifact":"macos-x64"}]}' ;;
+            macos-arm64) macos_matrix='{"include":[{"runner":"macos-15","artifact":"macos-arm64"}]}' ;;
+            *) macos_matrix='{"include":[{"runner":"macos-15-intel","artifact":"macos-x64"},{"runner":"macos-15","artifact":"macos-arm64"}]}' ;;
+          esac
+          echo "linux_matrix=$linux_matrix" >> "$GITHUB_OUTPUT"
+          echo "windows_matrix=$windows_matrix" >> "$GITHUB_OUTPUT"
+          echo "macos_matrix=$macos_matrix" >> "$GITHUB_OUTPUT"
+
+  android:
+    needs: prepare
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'android' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone private source tag
+        shell: pwsh
+        env:
+          SOURCE_TAG: ${{ needs.prepare.outputs.tag }}
+          GITEA_SSH_HOST: ${{ secrets.GITEA_SSH_HOST }}
+          GITEA_SSH_HOST_KEY: ${{ secrets.GITEA_SSH_HOST_KEY }}
+          GITEA_SSH_PRIVATE_KEY_BASE64: ${{ secrets.GITEA_SSH_PRIVATE_KEY_BASE64 }}
+          GITEA_SOURCE_REPOSITORY: ${{ secrets.GITEA_SOURCE_REPOSITORY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $requiredSecrets = @(
+            'GITEA_SSH_HOST',
+            'GITEA_SSH_HOST_KEY',
+            'GITEA_SSH_PRIVATE_KEY_BASE64',
+            'GITEA_SOURCE_REPOSITORY'
+          )
+          foreach ($secretName in $requiredSecrets) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($secretName))) {
+              throw "$secretName is empty or unavailable to this workflow."
+            }
+          }
+
+          $sshDirectory = Join-Path $env:RUNNER_TEMP 'vppn-ssh'
+          New-Item -ItemType Directory -Path $sshDirectory -Force | Out-Null
+          try {
+            $privateKey = Join-Path $sshDirectory 'id_ed25519'
+            $knownHosts = Join-Path $sshDirectory 'known_hosts'
+            $privateKeyText = [Text.Encoding]::UTF8.GetString(
+              [Convert]::FromBase64String($env:GITEA_SSH_PRIVATE_KEY_BASE64)
+            ).Replace("`r`n", "`n").Replace("`r", "`n").Trim() + "`n"
+            if (-not $privateKeyText.StartsWith('-----BEGIN OPENSSH PRIVATE KEY-----') -or
+                -not $privateKeyText.TrimEnd().EndsWith('-----END OPENSSH PRIVATE KEY-----')) {
+              throw 'GITEA_SSH_PRIVATE_KEY_BASE64 must decode to a complete OpenSSH private key.'
+            }
+            [IO.File]::WriteAllText($privateKey, $privateKeyText, [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($knownHosts, "$env:GITEA_SSH_HOST_KEY`n", [Text.UTF8Encoding]::new($false))
+            if ($IsWindows) {
+              $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+              $grant = "*$currentUserSid`:(R)"
+              & icacls.exe $privateKey /inheritance:r /grant:r $grant | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Unable to secure the deploy key ACL.' }
+            }
+            else {
+              chmod 600 $privateKey $knownHosts
+            }
+
+            & ssh-keygen -y -f $privateKey | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The decoded deploy key is not a valid private key.' }
+            & ssh-keygen -F $env:GITEA_SSH_HOST -f $knownHosts | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The pinned Gitea host key is invalid.' }
+
+            $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=`"$knownHosts`" -i `"$privateKey`""
+            git clone --depth 1 --branch $env:SOURCE_TAG $env:GITEA_SOURCE_REPOSITORY $env:SOURCE_DIR
+            if ($LASTEXITCODE -ne 0) { throw "Unable to clone source tag $env:SOURCE_TAG." }
+          }
+          finally {
+            Remove-Item -Recurse -Force $sshDirectory -ErrorAction SilentlyContinue
+            Remove-Item Env:GIT_SSH_COMMAND -ErrorAction SilentlyContinue
+          }
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Cache Android libXray
+        uses: actions/cache@v4
+        with:
+          path: |
+            source/.cache/libxray
+            source/android/app/libs/libXray.aar
+            source/android/app/libs/.libXray.aar.json
+          key: libxray-android-${{ runner.arch }}-${{ hashFiles('source/tool/build_libxray.py') }}
+      - name: Build Android packages
+        working-directory: source
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build apk --release --build-name "$VERSION" --build-number "$GITHUB_RUN_NUMBER"
+          flutter build appbundle --release --build-name "$VERSION" --build-number "$GITHUB_RUN_NUMBER"
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/vppn-client_${VERSION}_android.apk"
+          cp build/app/outputs/bundle/release/app-release.aab "dist/vppn-client_${VERSION}_android.aab"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: source/dist/*
+          if-no-files-found: error
+
+  linux:
+    needs: prepare
+    if: ${{ github.event_name != 'workflow_dispatch' || contains(fromJSON('["all","linux","linux-x64","linux-arm64"]'), inputs.target) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.linux_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clone private source tag
+        shell: pwsh
+        env:
+          SOURCE_TAG: ${{ needs.prepare.outputs.tag }}
+          GITEA_SSH_HOST: ${{ secrets.GITEA_SSH_HOST }}
+          GITEA_SSH_HOST_KEY: ${{ secrets.GITEA_SSH_HOST_KEY }}
+          GITEA_SSH_PRIVATE_KEY_BASE64: ${{ secrets.GITEA_SSH_PRIVATE_KEY_BASE64 }}
+          GITEA_SOURCE_REPOSITORY: ${{ secrets.GITEA_SOURCE_REPOSITORY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $requiredSecrets = @('GITEA_SSH_HOST', 'GITEA_SSH_HOST_KEY', 'GITEA_SSH_PRIVATE_KEY_BASE64', 'GITEA_SOURCE_REPOSITORY')
+          foreach ($secretName in $requiredSecrets) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($secretName))) {
+              throw "$secretName is empty or unavailable to this workflow."
+            }
+          }
+          $sshDirectory = Join-Path $env:RUNNER_TEMP 'vppn-ssh'
+          New-Item -ItemType Directory -Path $sshDirectory -Force | Out-Null
+          try {
+            $privateKey = Join-Path $sshDirectory 'id_ed25519'
+            $knownHosts = Join-Path $sshDirectory 'known_hosts'
+            $privateKeyText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:GITEA_SSH_PRIVATE_KEY_BASE64)).Replace("`r`n", "`n").Replace("`r", "`n").Trim() + "`n"
+            if (-not $privateKeyText.StartsWith('-----BEGIN OPENSSH PRIVATE KEY-----') -or -not $privateKeyText.TrimEnd().EndsWith('-----END OPENSSH PRIVATE KEY-----')) {
+              throw 'GITEA_SSH_PRIVATE_KEY_BASE64 must decode to a complete OpenSSH private key.'
+            }
+            [IO.File]::WriteAllText($privateKey, $privateKeyText, [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($knownHosts, "$env:GITEA_SSH_HOST_KEY`n", [Text.UTF8Encoding]::new($false))
+            chmod 600 $privateKey $knownHosts
+            & ssh-keygen -y -f $privateKey | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The decoded deploy key is not a valid private key.' }
+            & ssh-keygen -F $env:GITEA_SSH_HOST -f $knownHosts | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The pinned Gitea host key is invalid.' }
+            $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=`"$knownHosts`" -i `"$privateKey`""
+            git clone --depth 1 --branch $env:SOURCE_TAG $env:GITEA_SOURCE_REPOSITORY $env:SOURCE_DIR
+            if ($LASTEXITCODE -ne 0) { throw "Unable to clone source tag $env:SOURCE_TAG." }
+          }
+          finally {
+            Remove-Item -Recurse -Force $sshDirectory -ErrorAction SilentlyContinue
+            Remove-Item Env:GIT_SSH_COMMAND -ErrorAction SilentlyContinue
+          }
+      - name: Set up Flutter
+        if: matrix.artifact == 'linux-x64'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Set up Flutter on Linux ARM64
+        if: matrix.artifact == 'linux-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLUTTER_ROOT="$RUNNER_TEMP/flutter"
+          git clone --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$FLUTTER_ROOT"
+          echo "$FLUTTER_ROOT/bin" >> "$GITHUB_PATH"
+          "$FLUTTER_ROOT/bin/flutter" config --enable-linux-desktop
+          "$FLUTTER_ROOT/bin/flutter" --version
+      - name: Cache Xray release archive
+        uses: actions/cache@v4
+        with:
+          path: source/.cache/xray
+          key: xray-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/tool/xray_artifacts.json') }}
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libayatana-appindicator3-dev
+      - name: Build Linux package
+        working-directory: source
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s/^version:.*/version: $VERSION/" pubspec.yaml
+          flutter pub get
+          ./linux/build_deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: source/dist/*.deb
+          if-no-files-found: error
+
+  windows:
+    needs: prepare
+    if: ${{ github.event_name != 'workflow_dispatch' || contains(fromJSON('["all","windows","windows-x64","windows-arm64"]'), inputs.target) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.windows_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clone private source tag
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ needs.prepare.outputs.tag }}
+          GITEA_SSH_HOST: ${{ secrets.GITEA_SSH_HOST }}
+          GITEA_SSH_HOST_KEY: ${{ secrets.GITEA_SSH_HOST_KEY }}
+          GITEA_SSH_PRIVATE_KEY_BASE64: ${{ secrets.GITEA_SSH_PRIVATE_KEY_BASE64 }}
+          GITEA_SOURCE_REPOSITORY: ${{ secrets.GITEA_SOURCE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          SSH_DIR="$(cygpath -u "$RUNNER_TEMP")/vppn-ssh"
+          mkdir -p "$SSH_DIR"
+          chmod 700 "$SSH_DIR"
+          trap 'rm -rf "$SSH_DIR"' EXIT
+          required_secrets=(GITEA_SSH_HOST GITEA_SSH_HOST_KEY GITEA_SSH_PRIVATE_KEY_BASE64 GITEA_SOURCE_REPOSITORY)
+          for secret_name in "${required_secrets[@]}"; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "$secret_name is empty or unavailable to this workflow." >&2
+              exit 1
+            fi
+          done
+          python -c 'import base64, os, pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["GITEA_SSH_PRIVATE_KEY_BASE64"], validate=True))' "$SSH_DIR/id_ed25519" || {
+            echo "GITEA_SSH_PRIVATE_KEY_BASE64 is not valid Base64." >&2
+            exit 1
+          }
+          printf '%s\n' "$GITEA_SSH_HOST_KEY" > "$SSH_DIR/known_hosts"
+          chmod 600 "$SSH_DIR/id_ed25519" "$SSH_DIR/known_hosts"
+          if [[ "$(head -n 1 "$SSH_DIR/id_ed25519")" != "-----BEGIN OPENSSH PRIVATE KEY-----" ]]; then
+            echo "GITEA_SSH_PRIVATE_KEY_BASE64 must decode to the complete OpenSSH private key." >&2
+            exit 1
+          fi
+          ssh-keygen -y -f "$SSH_DIR/id_ed25519" >/dev/null || {
+            echo "The decoded GITEA_SSH_PRIVATE_KEY_BASE64 could not be parsed as a private key." >&2
+            exit 1
+          }
+          ssh-keygen -F "$GITEA_SSH_HOST" -f "$SSH_DIR/known_hosts" >/dev/null || {
+            echo "The pinned GITEA_SSH_HOST_KEY is invalid." >&2
+            exit 1
+          }
+          GIT_SSH_COMMAND="ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -i $SSH_DIR/id_ed25519" \
+            git clone --depth 1 --branch "$SOURCE_TAG" "$GITEA_SOURCE_REPOSITORY" "$SOURCE_DIR"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: ${{ matrix.flutter_channel }}
+          architecture: ${{ matrix.flutter_arch }}
+          cache: true
+      - name: Cache Xray release archive
+        uses: actions/cache@v4
+        with:
+          path: source/.cache/xray
+          key: xray-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/tool/xray_artifacts.json') }}
+      - name: Build Windows installer
+        working-directory: source
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          INSTALLER_ARGS: ${{ matrix.installer_args }}
+          REDIST_ARCH: ${{ matrix.redist_arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          (Get-Content pubspec.yaml -Raw) -replace '(?m)^version:.*$', "version: $env:VERSION" | Set-Content -NoNewline -Encoding utf8 pubspec.yaml
+          flutter pub get
+          flutter build windows --release --build-name $env:VERSION --build-number $env:GITHUB_RUN_NUMBER
+
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup 6 was not found' }
+
+          $languageFile = Join-Path (Split-Path $iscc) 'Languages\ChineseSimplified.isl'
+          if (-not (Test-Path $languageFile)) {
+            New-Item -ItemType Directory -Path (Split-Path $languageFile) -Force | Out-Null
+            curl.exe --fail --location --retry 3 --output $languageFile 'https://raw.githubusercontent.com/jrsoftware/issrc/refs/heads/main/Files/Languages/ChineseSimplified.isl'
+            if ($LASTEXITCODE -ne 0) { throw "Failed to download ChineseSimplified.isl with exit code $LASTEXITCODE" }
+          }
+          if (-not (Test-Path $languageFile)) { throw 'Inno Setup ChineseSimplified.isl was not found' }
+          if ((Get-Content $languageFile -TotalCount 1) -notmatch 'Inno Setup version .* Chinese Simplified messages') { throw 'Invalid Inno Setup ChineseSimplified.isl' }
+
+          $redist = Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio" -Filter "vc_redist.$env:REDIST_ARCH.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $redist) { throw "vc_redist.$env:REDIST_ARCH.exe was not found" }
+          $define = "/DVCRedistPath=`"$($redist.FullName)`""
+          $arguments = @('/Qp')
+          if ($env:INSTALLER_ARGS) { $arguments += $env:INSTALLER_ARGS }
+          $arguments += $define
+          $arguments += 'windows/windows-setup.iss'
+          $PSNativeCommandArgumentPassing = 'Legacy'
+          & $iscc $arguments
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: source/dist/*.exe
+          if-no-files-found: error
+
+  macos:
+    needs: prepare
+    if: ${{ github.event_name != 'workflow_dispatch' || contains(fromJSON('["all","macos","macos-x64","macos-arm64"]'), inputs.target) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.macos_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clone private source tag
+        shell: pwsh
+        env:
+          SOURCE_TAG: ${{ needs.prepare.outputs.tag }}
+          GITEA_SSH_HOST: ${{ secrets.GITEA_SSH_HOST }}
+          GITEA_SSH_HOST_KEY: ${{ secrets.GITEA_SSH_HOST_KEY }}
+          GITEA_SSH_PRIVATE_KEY_BASE64: ${{ secrets.GITEA_SSH_PRIVATE_KEY_BASE64 }}
+          GITEA_SOURCE_REPOSITORY: ${{ secrets.GITEA_SOURCE_REPOSITORY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $requiredSecrets = @('GITEA_SSH_HOST', 'GITEA_SSH_HOST_KEY', 'GITEA_SSH_PRIVATE_KEY_BASE64', 'GITEA_SOURCE_REPOSITORY')
+          foreach ($secretName in $requiredSecrets) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($secretName))) {
+              throw "$secretName is empty or unavailable to this workflow."
+            }
+          }
+          $sshDirectory = Join-Path $env:RUNNER_TEMP 'vppn-ssh'
+          New-Item -ItemType Directory -Path $sshDirectory -Force | Out-Null
+          try {
+            $privateKey = Join-Path $sshDirectory 'id_ed25519'
+            $knownHosts = Join-Path $sshDirectory 'known_hosts'
+            $privateKeyText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:GITEA_SSH_PRIVATE_KEY_BASE64)).Replace("`r`n", "`n").Replace("`r", "`n").Trim() + "`n"
+            if (-not $privateKeyText.StartsWith('-----BEGIN OPENSSH PRIVATE KEY-----') -or -not $privateKeyText.TrimEnd().EndsWith('-----END OPENSSH PRIVATE KEY-----')) {
+              throw 'GITEA_SSH_PRIVATE_KEY_BASE64 must decode to a complete OpenSSH private key.'
+            }
+            [IO.File]::WriteAllText($privateKey, $privateKeyText, [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($knownHosts, "$env:GITEA_SSH_HOST_KEY`n", [Text.UTF8Encoding]::new($false))
+            chmod 600 $privateKey $knownHosts
+            & ssh-keygen -y -f $privateKey | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The decoded deploy key is not a valid private key.' }
+            & ssh-keygen -F $env:GITEA_SSH_HOST -f $knownHosts | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'The pinned Gitea host key is invalid.' }
+            $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=`"$knownHosts`" -i `"$privateKey`""
+            git clone --depth 1 --branch $env:SOURCE_TAG $env:GITEA_SOURCE_REPOSITORY $env:SOURCE_DIR
+            if ($LASTEXITCODE -ne 0) { throw "Unable to clone source tag $env:SOURCE_TAG." }
+          }
+          finally {
+            Remove-Item -Recurse -Force $sshDirectory -ErrorAction SilentlyContinue
+            Remove-Item Env:GIT_SSH_COMMAND -ErrorAction SilentlyContinue
+          }
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Cache Xray release archive
+        uses: actions/cache@v4
+        with:
+          path: source/.cache/xray
+          key: xray-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('source/tool/xray_artifacts.json') }}
+      - name: Build unsigned macOS package
+        working-directory: source
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed -i.bak -E "s/^version:.*/version: $VERSION/" pubspec.yaml
+          rm -f pubspec.yaml.bak
+          flutter pub get
+          flutter build macos --release --build-name "$VERSION" --build-number "$GITHUB_RUN_NUMBER"
+          ./macos/build_dmg.sh --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: source/dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    needs:
+      - prepare
+      - android
+      - linux
+      - windows
+      - macos
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
+
+      - name: Publish packages to Linux host
+        if: ${{ github.event_name == 'push' }}
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_HOST_KEY: ${{ secrets.DEPLOY_SSH_HOST_KEY }}
+          DEPLOY_SSH_PRIVATE_KEY_BASE64: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_secrets=(DEPLOY_SSH_HOST DEPLOY_SSH_USER DEPLOY_SSH_HOST_KEY DEPLOY_SSH_PRIVATE_KEY_BASE64)
+          for secret_name in "${required_secrets[@]}"; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "$secret_name is empty or unavailable to this workflow." >&2
+              exit 1
+            fi
+          done
+
+          deploy_port="${DEPLOY_SSH_PORT:-22}"
+          if [[ ! "$deploy_port" =~ ^[0-9]+$ ]] || (( deploy_port < 1 || deploy_port > 65535 )); then
+            echo "DEPLOY_SSH_PORT must be a valid TCP port." >&2
+            exit 1
+          fi
+
+          ssh_directory="$RUNNER_TEMP/vppn-deploy-ssh"
+          install -d -m 700 "$ssh_directory"
+          private_key="$ssh_directory/id_ed25519"
+          known_hosts="$ssh_directory/known_hosts"
+          trap 'rm -rf "$ssh_directory"' EXIT
+
+          python3 - "$private_key" <<'PY'
+          import base64
+          import binascii
+          import os
+          import pathlib
+          import sys
+
+          value = os.environ["DEPLOY_SSH_PRIVATE_KEY_BASE64"].strip()
+          if value.startswith("-----BEGIN OPENSSH PRIVATE KEY-----"):
+              key = value.encode()
+          else:
+              try:
+                  key = base64.b64decode("".join(value.split()), validate=True)
+              except binascii.Error:
+                  raise SystemExit(
+                      "DEPLOY_SSH_PRIVATE_KEY_BASE64 must contain an OpenSSH private key "
+                      "or its Base64 encoding."
+                  )
+          key = key.replace(b"\r\n", b"\n").replace(b"\r", b"\n").strip() + b"\n"
+          if (
+              not key.startswith(b"-----BEGIN OPENSSH PRIVATE KEY-----\n")
+              or not key.endswith(b"\n-----END OPENSSH PRIVATE KEY-----\n")
+          ):
+              raise SystemExit("The deploy secret does not contain an OpenSSH private key.")
+          pathlib.Path(sys.argv[1]).write_bytes(key)
+          PY
+          printf '%s\n' "$DEPLOY_SSH_HOST_KEY" > "$known_hosts"
+          chmod 600 "$private_key" "$known_hosts"
+          ssh-keygen -y -f "$private_key" >/dev/null
+
+          mapfile -d '' packages < <(find dist -maxdepth 1 -type f -print0)
+          if (( ${#packages[@]} == 0 )); then
+            echo 'No release packages were found in dist.' >&2
+            exit 1
+          fi
+
+          ssh_options=(
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$known_hosts"
+            -i "$private_key"
+            -p "$deploy_port"
+          )
+          remote_directory="/www/wwwroot/accloud/vppn/$RELEASE_TAG"
+          ssh "${ssh_options[@]}" "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" \
+            "rm -rf -- '$remote_directory' && mkdir -p -- '$remote_directory'"
+          if ! command -v rsync >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes rsync
+          fi
+          export RSYNC_RSH="ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts -i $private_key -p $deploy_port"
+          rsync --archive --delete dist/ \
+            "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:$remote_directory/"
+
+      - name: Send Telegram notification
+        if: ${{ github.event_name == 'push' && success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          WORKER_DEPLOY_CHAT_ID: ${{ secrets.WORKER_DEPLOY_CHAT_ID }}
+          WORKER_DEPLOY_API_KEY: ${{ secrets.WORKER_DEPLOY_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${WORKER_DEPLOY_CHAT_ID:-}" || -z "${WORKER_DEPLOY_API_KEY:-}" ]]; then
+            echo 'WORKER_DEPLOY_CHAT_ID and WORKER_DEPLOY_API_KEY are required.' >&2
+            exit 1
+          fi
+
+          TAG_MESSAGE=''
+          tag_object="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG")"
+          if [[ "$(jq -r '.object.type' <<< "$tag_object")" == 'tag' ]]; then
+            tag_sha="$(jq -r '.object.sha' <<< "$tag_object")"
+            TAG_MESSAGE="$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '.message // ""')"
+          fi
+
+          run_started_at="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" --jq '.run_started_at')"
+          start_seconds="$(date -d "$run_started_at" +%s)"
+          end_seconds="$(date +%s)"
+          total_seconds="$((end_seconds - start_seconds))"
+          deploy_time="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+          MESSAGE="$(printf '提示:\n\nvppn-client 已经更新到: %s' "$VERSION")"
+          if [[ -n "${TAG_MESSAGE:-}" ]]; then
+            MESSAGE="$(printf '%s\n%s' "$MESSAGE" "$TAG_MESSAGE")"
+          fi
+          MESSAGE="$(printf '%s\n当前时间: %s\n共计时长: %ss' "$MESSAGE" "$deploy_time" "$total_seconds")"
+          payload="$(printf '%s' "$MESSAGE" | python3 -c 'import json, sys; print(json.dumps({"chat_id": sys.argv[1], "message": sys.stdin.read()}))' "$WORKER_DEPLOY_CHAT_ID")"
+          curl --fail-with-body --retry 3 -X POST 'https://worker-deploy.allcloud.top/push_message' \
+            -H 'Content-Type: application/json' \
+            -H "x-api-key: ${WORKER_DEPLOY_API_KEY}" \
+            -d "$payload"
